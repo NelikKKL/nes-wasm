@@ -3,6 +3,7 @@ mod bus;
 mod cartridge;
 mod controller;
 mod cpu;
+mod player;
 mod ppu;
 
 use bus::Bus;
@@ -73,6 +74,16 @@ impl Emulator {
 }
 
 impl Emulator {
+    /// RGBA-буфер кадра 256x240 (для высокоуровневого API).
+    pub(crate) fn frame_buffer(&self) -> &[u8] {
+        &self.bus.ppu.frame
+    }
+
+    /// Сэмплы звука, накопленные за последний кадр (моно, f32).
+    pub(crate) fn audio_samples(&self) -> &[f32] {
+        &self.bus.apu.samples
+    }
+
     fn step(&mut self) {
         self.cpu.irq = self.bus.apu.irq_pending() || self.bus.cart.irq_pending();
         let mut cycles = self.cpu.step(&mut self.bus);

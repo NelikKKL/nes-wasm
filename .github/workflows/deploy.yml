@@ -32,11 +32,28 @@ jobs:
           version: latest
 
       - name: Build wasm
-        run: wasm-pack build --release --target web --out-dir web/pkg
+        run: wasm-pack build --release --target web --out-dir pkg
+
+      # Библиотека — ровно три файла. Демо-страница лежит рядом только для проверки.
+      - name: Collect library files
+        run: |
+          mkdir -p dist
+          cp pkg/nes_wasm.js pkg/nes_wasm_bg.wasm dist/
+          cp js/audio-worklet.js dist/
+          cp examples/index.html dist/
+
+      - name: Upload library (3 files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nes-wasm-lib
+          path: |
+            dist/nes_wasm.js
+            dist/nes_wasm_bg.wasm
+            dist/audio-worklet.js
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: web
+          path: dist
 
   deploy:
     if: github.ref == 'refs/heads/main'

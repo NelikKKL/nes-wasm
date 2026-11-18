@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NES</title>
+  <style>
+    :root { --bg:#17171a; --panel:#222226; --line:#38383f; --text:#ebe9e4; --muted:#8e8c88; --accent:#d1252e; color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+           background: var(--bg); color: var(--text); font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { width: min(100%, 768px); display: grid; gap: 12px; }
+    #game { background: #000; border: 1px solid var(--line); border-radius: 6px; padding: 6px; }
+    .bar { display: flex; flex-wrap: wrap; gap: 8px; }
+    button, .btn { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+                   border-radius: 4px; padding: 10px 14px; cursor: pointer; }
+    button:hover, .btn:hover { border-color: var(--muted); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:focus-visible, .btn:focus-within { outline: 2px solid var(--text); outline-offset: 2px; }
+    .notes { display: grid; gap: 2px; }
+    .notes p { margin: 0; color: var(--muted); font-size: 14px; min-height: 1.4em; overflow-wrap: anywhere; }
+    dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 20px; width: min(94vw, 560px); }
+    dialog::backdrop { background: rgba(0, 0, 0, .65); }
+    dialog h2 { margin: 0 0 4px; font-size: 20px; }
+    dialog .hint { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .cols h3 { margin: 0 0 8px; font-size: 16px; }
+    .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; }
+    .key { min-width: 96px; text-align: center; padding: 6px 10px; background: var(--bg); }
+    .key.listening { border-color: var(--accent); color: var(--accent); }
+    .actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 20px; }
+    @media (max-width: 480px) { .cols { grid-template-columns: 1fr; gap: 16px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div id="game"></div>
+    <div class="bar">
+      <label class="btn primary">Открыть ROM<input id="rom" type="file" accept=".nes" hidden></label>
+      <button id="pause" type="button">Пауза</button>
+      <button id="reset" type="button">Сброс</button>
+      <button id="mute" type="button">Звук: вкл</button>
+      <button id="binds" type="button">Управление</button>
+    </div>
+    <div class="notes">
+      <p id="status">Выбери .nes файл или перетащи его на страницу.</p>
+      <p id="audio-status"></p>
+    </div>
+  </main>
+
+  <dialog id="dlg">
+    <h2>Управление</h2>
+    <p class="hint">Нажми на кнопку справа от действия, затем на нужную клавишу. Backspace убирает привязку, Esc отменяет.</p>
+    <div class="cols" id="cols"></div>
+    <div class="actions">
+      <button id="defaults" type="button">Сбросить</button>
+      <button id="close" type="button">Готово</button>
+    </div>
+  </dialog>
+
+  <script type="module">
+    // Всё, что нужно библиотеке: nes_wasm.js, nes_wasm_bg.wasm и audio-worklet.js рядом с этой страницей.
+    import init, { Nes } from './nes_wasm.js';
+
+    await init();
+
+    const MUTE_KEY = 'demo-muted';
+    let muted = false;
+    try { muted = localStorage.getItem(MUTE_KEY) === '1'; } catch { /* ignore */ }
+
+    const nes = new Nes(document.getElementById('game'), {
+      muted,
+      workletUrl: new URL('./audio-worklet.js', import.meta.url).href,
+    });
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (text) => { $('status').textContent = text; };
+
+    // ---- ROM ----
+    async function loadFile(file) {
+      try {
+        nes.loadRom(new Uint8Array(await file.arrayBuffer()));
+        $('pause').textContent = 'Пауза';
+        setStatus(file.name);
+      } catch (e) {
+        setStatus(`Ошибка: ${e}`);
+      }
+    }
+    $('rom').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) loadFile(f); e.target.value = ''; });
+    addEventListener('dragover', (e) => e.preventDefault());
+    addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
+
+    // ---- кнопки ----
+    $('pause').addEventListener('click', () => {
+      if (nes.paused) nes.resume(); else nes.pause();
+      $('pause').textContent = nes.paused ? 'Продолжить' : 'Пауза';
+    });
+    $('reset').addEventListener('click', () => nes.reset());
+    const renderMute = () => { $('mute').textContent = nes.muted ? 'Звук: выкл' : 'Звук: вкл'; };
+    renderMute();
+    $('mute').addEventListener('click', () => {
+      nes.setMuted(!nes.muted);
+      try { localStorage.setItem(MUTE_KEY, nes.muted ? '1' : '0'); } catch { /* ignore */ }
+      renderMute();
+    });
+    setInterval(() => { $('audio-status').textContent = nes.audioStatus(); }, 500);
+
+    // ---- окно «Управление» на API привязок ----
+    const NAMES = ['A', 'B', 'Select', 'Start', 'Up', 'Down', 'Left', 'Right'];
+    const SHOWN = ['A', 'B', 'Select', 'Start', '↑', '↓', '←', '→'];
+    const dlg = $('dlg');
+    let listening = null; // { p, name }
+    let pausedBefore = false;
+
+    const keyLabel = (code) => {
+      if (!code) return '—';
+      const special = { ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→',
+        ShiftLeft: 'L Shift', ShiftRight: 'R Shift', ControlLeft: 'L Ctrl', ControlRight: 'R Ctrl' };
+      return special[code] ?? code.replace(/^Key|^Digit/, '');
+    };
+
+    function renderBinds() {
+      const all = nes.getBindings();
+      $('cols').replaceChildren(...[0, 1].map((p) => {
+        const col = document.createElement('section');
+        const title = document.createElement('h3');
+        title.textContent = `Игрок ${p + 1}`;
+        col.append(title);
+        NAMES.forEach((name, i) => {
+          const row = document.createElement('div');
+          row.className = 'row';
+          const label = document.createElement('span');
+          label.textContent = SHOWN[i];
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'key';
+          const active = listening && listening.p === p && listening.name === name;
+          if (active) btn.classList.add('listening');
+          btn.textContent = active ? 'Нажми клавишу…' : keyLabel(all[p][name]);
+          btn.addEventListener('click', () => {
+            nes.cancelCapture();
+            listening = { p, name };
+            renderBinds();
+            nes.captureBinding(p, name).then(() => { listening = null; renderBinds(); });
+          });
+          row.append(label, btn);
+          col.append(row);
+        });
+        return col;
+      }));
+    }
+
+    $('binds').addEventListener('click', () => {
+      pausedBefore = nes.paused;
+      nes.pause();
+      listening = null;
+      renderBinds();
+      dlg.showModal();
+    });
+    $('defaults').addEventListener('click', () => { nes.cancelCapture(); nes.resetBindings(); renderBinds(); });
+    $('close').addEventListener('click', () => dlg.close());
+    dlg.addEventListener('close', () => {
+      nes.cancelCapture();
+      if (!pausedBefore) nes.resume();
+    });
+  </script>
+</body>
+</html>
