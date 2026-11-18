@@ -39,6 +39,7 @@ pub struct Ppu {
     scanline: i16, // -1 (pre-render) ..= 260
     cycle: u16,    // 0..=340
     odd_frame: bool,
+    dots: u64, // сколько тактов PPU прошло всего (для MMC3)
 
     // фон: данные следующего тайла и сдвиговые регистры
     nt_id: u8,
@@ -107,6 +108,7 @@ impl Ppu {
             scanline: 0,
             cycle: 0,
             odd_frame: false,
+            dots: 0,
             nt_id: 0,
             nt_attr: 0,
             nt_lo: 0,
@@ -348,6 +350,17 @@ impl Ppu {
             }
             self.spr_count += 1;
         }
+        // Железо всегда делает 8 выборок спрайтов; пустые слоты читают тайл $FF.
+        // Эти чтения нужны MMC3: по ним меняется линия A12.
+        for _ in self.spr_count..8 {
+            let addr: u16 = if h == 8 {
+                ((((self.ctrl >> 3) & 1) as u16) << 12) + 0x0FF0
+            } else {
+                0x1FE0
+            };
+            cart.ppu_read(addr);
+            cart.ppu_read(addr + 8);
+        }
     }
 
     // ---------- вывод пикселя ----------
@@ -422,6 +435,7 @@ impl Ppu {
     // ---------- один такт PPU ----------
 
     pub fn tick(&mut self, cart: &mut Cartridge) {
+        cart.set_ppu_clock(self.dots);
         let rendering = self.mask & 0x18 != 0;
         let sl = self.scanline;
         let cy = self.cycle;
@@ -453,7 +467,9 @@ impl Ppu {
             if cy == 257 {
                 self.spr_count = 0;
                 self.spr_zero = false;
-                if rendering && sl >= 0 {
+                // на pre-render строке (-1) тоже: железо делает холостые выборки спрайтов,
+                // и по ним MMC3 считает строки
+                if rendering {
                     self.eval_sprites(sl, cart);
                 }
             }
@@ -469,6 +485,7 @@ impl Ppu {
             }
         }
 
+        self.dots = self.dots.wrapping_add(1);
         self.cycle += 1;
         // на нечётных кадрах pre-render строка на такт короче
         if self.scanline == -1 && self.cycle == 339 && self.odd_frame && rendering {

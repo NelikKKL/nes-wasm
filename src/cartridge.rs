@@ -7,7 +7,7 @@ pub enum Mirroring {
     FourScreen,
 }
 
-/// Картридж + мапперы 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM), 7 (AxROM).
+/// Картридж + мапперы 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM), 4 (MMC3), 7 (AxROM).
 pub struct Cartridge {
     mapper: u8,
     prg: Vec<u8>,
@@ -21,6 +21,17 @@ pub struct Cartridge {
     chr0: u8,
     chr1: u8,
     prg_bank: u8,
+    // MMC3
+    mmc3_cmd: u8,
+    bank_regs: [u8; 8],
+    irq_latch: u8,
+    irq_counter: u8,
+    irq_reload: bool,
+    irq_enable: bool,
+    irq_pending: bool,
+    a12: bool,
+    a12_low_since: u64,
+    ppu_clock: u64,
 }
 
 impl Cartridge {
@@ -45,7 +56,7 @@ impl Cartridge {
         if prg_size == 0 || data.len() < start + prg_size + chr_size {
             return Err("ROM повреждён или обрезан".to_string());
         }
-        if !matches!(mapper, 0 | 1 | 2 | 3 | 7) {
+        if !matches!(mapper, 0 | 1 | 2 | 3 | 4 | 7) {
             return Err(format!("Маппер {} пока не поддерживается", mapper));
         }
 
@@ -68,11 +79,57 @@ impl Cartridge {
             chr0: 0,
             chr1: 0,
             prg_bank: 0,
+            mmc3_cmd: 0,
+            bank_regs: [0, 2, 4, 5, 6, 7, 0, 1],
+            irq_latch: 0,
+            irq_counter: 0,
+            irq_reload: false,
+            irq_enable: false,
+            irq_pending: false,
+            a12: false,
+            a12_low_since: 0,
+            ppu_clock: 0,
         })
     }
 
     pub fn mirroring(&self) -> Mirroring {
         self.mirroring
+    }
+
+    /// PPU сообщает текущий такт (в точках PPU) — нужно MMC3 для фильтра линии A12.
+    pub fn set_ppu_clock(&mut self, dots: u64) {
+        self.ppu_clock = dots;
+    }
+
+    /// Линия IRQ маппера (MMC3).
+    pub fn irq_pending(&self) -> bool {
+        self.irq_pending
+    }
+
+    /// MMC3 считает фронты A12 (0 -> 1). Фронт засчитывается, только если линия
+    /// перед этим была в нуле достаточно долго — как фильтр по M2 в железе.
+    fn watch_a12(&mut self, addr: u16) {
+        let high = addr & 0x1000 != 0;
+        if high && !self.a12 {
+            if self.ppu_clock.wrapping_sub(self.a12_low_since) >= 9 {
+                self.clock_irq();
+            }
+        } else if !high && self.a12 {
+            self.a12_low_since = self.ppu_clock;
+        }
+        self.a12 = high;
+    }
+
+    fn clock_irq(&mut self) {
+        if self.irq_counter == 0 || self.irq_reload {
+            self.irq_counter = self.irq_latch;
+            self.irq_reload = false;
+        } else {
+            self.irq_counter -= 1;
+        }
+        if self.irq_counter == 0 && self.irq_enable {
+            self.irq_pending = true;
+        }
     }
 
     // ---------- CPU сторона ----------
@@ -125,6 +182,19 @@ impl Cartridge {
                     len - 0x4000 + (off - 0x4000)
                 }
             }
+            4 => {
+                let n = len / 0x2000; // число 8K-банков
+                let swap = self.mmc3_cmd & 0x40 != 0;
+                let bank = match (off >> 13, swap) {
+                    (0, false) => self.bank_regs[6] as usize,
+                    (0, true) => n - 2,
+                    (1, _) => self.bank_regs[7] as usize,
+                    (2, false) => n - 2,
+                    (2, true) => self.bank_regs[6] as usize,
+                    _ => n - 1,
+                };
+                (bank % n) * 0x2000 + (off & 0x1FFF)
+            }
             7 => (self.prg_bank as usize & 7) * 0x8000 + off,
             _ => off, // 0 и 3
         };
@@ -162,6 +232,29 @@ impl Cartridge {
             }
             2 => self.prg_bank = val,
             3 => self.chr0 = val,
+            4 => match addr & 0xE001 {
+                0x8000 => self.mmc3_cmd = val,
+                0x8001 => {
+                    let r = (self.mmc3_cmd & 7) as usize;
+                    self.bank_regs[r] = val;
+                }
+                0xA000 => {
+                    if self.mirroring != Mirroring::FourScreen {
+                        self.mirroring = if val & 1 != 0 { Mirroring::Horizontal } else { Mirroring::Vertical };
+                    }
+                }
+                0xC000 => self.irq_latch = val,
+                0xC001 => {
+                    self.irq_counter = 0;
+                    self.irq_reload = true;
+                }
+                0xE000 => {
+                    self.irq_enable = false;
+                    self.irq_pending = false;
+                }
+                0xE001 => self.irq_enable = true,
+                _ => {}
+            },
             7 => {
                 self.prg_bank = val & 7;
                 self.mirroring = if val & 0x10 != 0 {
@@ -189,12 +282,43 @@ impl Cartridge {
                 }
             }
             3 => self.chr0 as usize * 0x2000 + a,
+            4 => {
+                let r = &self.bank_regs;
+                let slot = a >> 10; // номер 1K-окна: 0..7
+                let bank = if self.mmc3_cmd & 0x80 == 0 {
+                    match slot {
+                        0 => r[0] & 0xFE,
+                        1 => r[0] | 1,
+                        2 => r[1] & 0xFE,
+                        3 => r[1] | 1,
+                        4 => r[2],
+                        5 => r[3],
+                        6 => r[4],
+                        _ => r[5],
+                    }
+                } else {
+                    match slot {
+                        0 => r[2],
+                        1 => r[3],
+                        2 => r[4],
+                        3 => r[5],
+                        4 => r[0] & 0xFE,
+                        5 => r[0] | 1,
+                        6 => r[1] & 0xFE,
+                        _ => r[1] | 1,
+                    }
+                };
+                bank as usize * 0x400 + (a & 0x3FF)
+            }
             _ => a,
         };
         idx % self.chr.len()
     }
 
     pub fn ppu_read(&mut self, addr: u16) -> u8 {
+        if self.mapper == 4 {
+            self.watch_a12(addr);
+        }
         let i = self.chr_index(addr);
         self.chr[i]
     }

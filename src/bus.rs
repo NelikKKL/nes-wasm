@@ -1,3 +1,4 @@
+use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::controller::Controller;
 use crate::ppu::Ppu;
@@ -5,6 +6,7 @@ use crate::ppu::Ppu;
 pub struct Bus {
     pub ram: [u8; 2048],
     pub ppu: Ppu,
+    pub apu: Apu,
     pub cart: Cartridge,
     pub pads: [Controller; 2],
     pub dma_pending: bool,
@@ -15,6 +17,7 @@ impl Bus {
         Bus {
             ram: [0; 2048],
             ppu: Ppu::new(),
+            apu: Apu::new(),
             cart,
             pads: [Controller::default(), Controller::default()],
             dma_pending: false,
@@ -25,6 +28,7 @@ impl Bus {
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize],
             0x2000..=0x3FFF => self.ppu.read_reg(addr & 7, &mut self.cart),
+            0x4015 => self.apu.read_status(),
             0x4016 => 0x40 | self.pads[0].read(),
             0x4017 => 0x40 | self.pads[1].read(),
             0x6000..=0xFFFF => self.cart.cpu_read(addr),
@@ -36,6 +40,7 @@ impl Bus {
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize] = val,
             0x2000..=0x3FFF => self.ppu.write_reg(addr & 7, val, &mut self.cart),
+            0x4000..=0x4013 | 0x4015 | 0x4017 => self.apu.write_reg(addr, val),
             0x4014 => {
                 let base = (val as u16) << 8;
                 let mut buf = [0u8; 256];

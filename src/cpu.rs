@@ -44,11 +44,13 @@ pub struct Cpu {
     pub cycles: u64,
     /// Выставляется PPU, обрабатывается в начале следующего шага.
     pub nmi: bool,
+    /// Уровень линии IRQ (APU, позже мапперы). Обрабатывается, если флаг I сброшен.
+    pub irq: bool,
 }
 
 impl Cpu {
     pub fn new() -> Cpu {
-        Cpu { a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: FI | FU, cycles: 0, nmi: false }
+        Cpu { a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: FI | FU, cycles: 0, nmi: false, irq: false }
     }
 
     pub fn reset(&mut self, bus: &mut Bus) {
@@ -60,6 +62,7 @@ impl Cpu {
         self.pc = bus.read16(0xFFFC);
         self.cycles = 7;
         self.nmi = false;
+        self.irq = false;
     }
 
     /// Выполняет одну инструкцию (или вход в NMI), возвращает число тактов CPU.
@@ -67,6 +70,11 @@ impl Cpu {
         if self.nmi {
             self.nmi = false;
             self.interrupt(bus, 0xFFFA, false);
+            self.cycles += 7;
+            return 7;
+        }
+        if self.irq && self.p & FI == 0 {
+            self.interrupt(bus, 0xFFFE, false);
             self.cycles += 7;
             return 7;
         }

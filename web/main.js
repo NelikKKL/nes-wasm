@@ -167,6 +167,66 @@ function pollGamepads() {
   }
 }
 
+// ---------- звук ----------
+
+const MUTE_KEY = 'nes-muted';
+const BUFFER_SECONDS = 0.05; // сколько звука держим про запас: меньше — отзывчивее, больше — устойчивее
+let muted = false;
+try { muted = localStorage.getItem(MUTE_KEY) === '1'; } catch { /* ignore */ }
+
+let audioCtx = null;
+let audioNode = null;
+let gainNode = null;
+let audioStarting = null;
+let level = 0; // сколько сэмплов сейчас лежит в буфере ворклета
+
+const muteBtn = document.getElementById('mute');
+const renderMute = () => { muteBtn.textContent = muted ? 'Звук: выкл' : 'Звук: вкл'; };
+renderMute();
+muteBtn.addEventListener('click', () => {
+  muted = !muted;
+  try { localStorage.setItem(MUTE_KEY, muted ? '1' : '0'); } catch { /* ignore */ }
+  if (gainNode) gainNode.gain.value = muted ? 0 : 1;
+  renderMute();
+});
+
+// iOS Safari считает жестом только touchend/click, поэтому слушаем несколько событий
+const AUDIO_EVENTS = ['pointerup', 'touchend', 'click', 'keydown'];
+
+const audioReady = () => !!audioNode && audioCtx.state === 'running';
+
+// AudioContext можно запустить только из пользовательского жеста
+function startAudio() {
+  if (audioStarting) return audioStarting;
+  audioStarting = (async () => {
+    try {
+      await null; // чтобы catch ниже не отработал раньше присваивания audioStarting
+      audioCtx = new AudioContext({ latencyHint: 'interactive' });
+      await audioCtx.audioWorklet.addModule('audio-worklet.js');
+      const node = new AudioWorkletNode(audioCtx, 'nes-audio', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      node.port.onmessage = (e) => { level = e.data; };
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = muted ? 0 : 1;
+      node.connect(gainNode).connect(audioCtx.destination);
+      if (audioCtx.state !== 'running') await audioCtx.resume();
+      audioNode = node;
+      if (emu) emu.set_sample_rate(audioCtx.sampleRate);
+      for (const ev of AUDIO_EVENTS) window.removeEventListener(ev, startAudio);
+    } catch (err) {
+      console.warn('Звук недоступен:', err);
+      audioCtx = null;
+      audioNode = null;
+      audioStarting = null; // попробуем ещё раз при следующем жесте
+    }
+  })();
+  return audioStarting;
+}
+for (const ev of AUDIO_EVENTS) window.addEventListener(ev, startAudio);
+
 // ---------- эмулятор ----------
 
 const canvas = document.getElementById('screen');
@@ -187,6 +247,7 @@ async function loadRom(file) {
     const next = new Emulator(bytes);
     if (emu) emu.free();
     emu = next;
+    if (audioCtx) emu.set_sample_rate(audioCtx.sampleRate);
     paused = false;
     pauseBtn.textContent = 'Пауза';
     setStatus(file.name);
@@ -212,20 +273,39 @@ pauseBtn.addEventListener('click', () => {
 });
 document.getElementById('reset').addEventListener('click', () => { if (emu) emu.reset(); });
 
+function runFrame() {
+  pollGamepads();
+  emu.set_pad(0, keys[0] | pads[0]);
+  emu.set_pad(1, keys[1] | pads[1]);
+  emu.frame();
+  if (audioReady()) {
+    const n = emu.audio_len();
+    if (n > 0) {
+      // копируем из памяти wasm и передаём буфер ворклету без копирования
+      const chunk = new Float32Array(wasmMemory.buffer, emu.audio_ptr(), n).slice();
+      audioNode.port.postMessage(chunk, [chunk.buffer]);
+      level += n;
+    }
+  }
+}
+
 function loop(t) {
   requestAnimationFrame(loop);
   if (!emu || paused) { last = t; return; }
-  acc += Math.min(t - last, 100);
-  last = t;
-  let ran = false;
-  while (acc >= FRAME_MS) {
-    pollGamepads();
-    emu.set_pad(0, keys[0] | pads[0]);
-    emu.set_pad(1, keys[1] | pads[1]);
-    emu.frame();
-    acc -= FRAME_MS;
-    ran = true;
+
+  let ran = 0;
+  if (audioReady()) {
+    // темп задаёт звук: считаем кадры, пока в буфере меньше целевого запаса
+    const target = audioCtx.sampleRate * BUFFER_SECONDS;
+    while (level < target && ran < 4) { runFrame(); ran++; }
+    acc = 0;
+  } else {
+    // звука нет (ещё не было жеста или он недоступен) — темп по таймеру
+    acc += Math.min(t - last, 100);
+    while (acc >= FRAME_MS) { runFrame(); acc -= FRAME_MS; ran++; }
   }
+  last = t;
+
   if (ran) {
     // память wasm может вырасти, поэтому view создаём заново каждый кадр
     const pixels = new Uint8ClampedArray(wasmMemory.buffer, emu.frame_ptr(), W * H * 4);

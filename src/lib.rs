@@ -1,3 +1,4 @@
+mod apu;
 mod bus;
 mod cartridge;
 mod controller;
@@ -30,12 +31,14 @@ impl Emulator {
 
     /// Сброс консоли (кнопка Reset).
     pub fn reset(&mut self) {
+        self.bus.apu.reset();
         self.cpu.reset(&mut self.bus);
     }
 
     /// Прогоняет один полный кадр (~29780 тактов CPU).
     pub fn frame(&mut self) {
         self.bus.ppu.frame_complete = false;
+        self.bus.apu.samples.clear();
         while !self.bus.ppu.frame_complete {
             self.step();
         }
@@ -44,6 +47,20 @@ impl Emulator {
     /// Указатель на RGBA-буфер 256x240 в памяти wasm.
     pub fn frame_ptr(&self) -> *const u8 {
         self.bus.ppu.frame.as_ptr()
+    }
+
+    /// Частота дискретизации аудио (AudioContext.sampleRate). Вызывать после создания.
+    pub fn set_sample_rate(&mut self, rate: f32) {
+        self.bus.apu.set_sample_rate(rate as f64);
+    }
+
+    /// Указатель на f32-сэмплы (моно), накопленные за последний `frame()`.
+    pub fn audio_ptr(&self) -> *const f32 {
+        self.bus.apu.samples.as_ptr()
+    }
+
+    pub fn audio_len(&self) -> usize {
+        self.bus.apu.samples.len()
     }
 
     /// Состояние кнопок игрока (0 или 1) целиком.
@@ -57,10 +74,14 @@ impl Emulator {
 
 impl Emulator {
     fn step(&mut self) {
+        self.cpu.irq = self.bus.apu.irq_pending() || self.bus.cart.irq_pending();
         let mut cycles = self.cpu.step(&mut self.bus);
         if self.bus.dma_pending {
             self.bus.dma_pending = false;
             cycles += 513 + (self.cpu.cycles & 1) as u32;
+        }
+        for _ in 0..cycles {
+            self.bus.apu.tick(&self.bus.cart);
         }
         // на 1 такт CPU приходится 3 такта PPU
         for _ in 0..cycles * 3 {
