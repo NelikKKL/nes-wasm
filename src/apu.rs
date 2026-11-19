@@ -1,4 +1,5 @@
 use crate::cartridge::Cartridge;
+use crate::state::{Reader, Writer};
 
 const CPU_HZ: f64 = 1_789_773.0;
 
@@ -656,5 +657,200 @@ impl Apu {
             self.hp_out = out;
             self.samples.push(out.clamp(-1.0, 1.0));
         }
+    }
+}
+
+// ---------- сохранения ----------
+
+impl Envelope {
+    fn save(&self, out: &mut Writer) {
+        out.bool(self.start);
+        out.bool(self.looping);
+        out.bool(self.constant);
+        out.u8(self.period);
+        out.u8(self.divider);
+        out.u8(self.decay);
+    }
+
+    fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.start = r.bool()?;
+        self.looping = r.bool()?;
+        self.constant = r.bool()?;
+        self.period = r.u8()?;
+        self.divider = r.u8()?;
+        self.decay = r.u8()?;
+        Ok(())
+    }
+}
+
+impl Pulse {
+    fn save(&self, out: &mut Writer) {
+        out.bool(self.enabled);
+        out.u8(self.duty);
+        out.u8(self.seq);
+        out.u16(self.timer);
+        out.u16(self.period);
+        out.u8(self.length);
+        out.bool(self.halt);
+        self.env.save(out);
+        out.bool(self.sweep_enabled);
+        out.u8(self.sweep_period);
+        out.bool(self.sweep_negate);
+        out.u8(self.sweep_shift);
+        out.u8(self.sweep_divider);
+        out.bool(self.sweep_reload);
+    }
+
+    fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.enabled = r.bool()?;
+        self.duty = r.u8()? & 3;
+        self.seq = r.u8()? & 7;
+        self.timer = r.u16()?;
+        self.period = r.u16()? & 0x7FF;
+        self.length = r.u8()?;
+        self.halt = r.bool()?;
+        self.env.load(r)?;
+        self.sweep_enabled = r.bool()?;
+        self.sweep_period = r.u8()? & 7;
+        self.sweep_negate = r.bool()?;
+        self.sweep_shift = r.u8()? & 7;
+        self.sweep_divider = r.u8()?;
+        self.sweep_reload = r.bool()?;
+        Ok(())
+    }
+}
+
+impl Triangle {
+    fn save(&self, out: &mut Writer) {
+        out.bool(self.enabled);
+        out.bool(self.control);
+        out.u8(self.linear_value);
+        out.u8(self.linear);
+        out.bool(self.linear_reload);
+        out.u16(self.period);
+        out.u16(self.timer);
+        out.u8(self.seq);
+        out.u8(self.length);
+    }
+
+    fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.enabled = r.bool()?;
+        self.control = r.bool()?;
+        self.linear_value = r.u8()? & 0x7F;
+        self.linear = r.u8()?;
+        self.linear_reload = r.bool()?;
+        self.period = r.u16()? & 0x7FF;
+        self.timer = r.u16()?;
+        self.seq = r.u8()? & 31;
+        self.length = r.u8()?;
+        Ok(())
+    }
+}
+
+impl Noise {
+    fn save(&self, out: &mut Writer) {
+        out.bool(self.enabled);
+        out.bool(self.halt);
+        self.env.save(out);
+        out.bool(self.mode);
+        out.u16(self.period);
+        out.u16(self.timer);
+        out.u16(self.shift);
+        out.u8(self.length);
+    }
+
+    fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.enabled = r.bool()?;
+        self.halt = r.bool()?;
+        self.env.load(r)?;
+        self.mode = r.bool()?;
+        self.period = r.u16()?.max(1);
+        self.timer = r.u16()?;
+        let shift = r.u16()? & 0x7FFF;
+        self.shift = if shift == 0 { 1 } else { shift };
+        self.length = r.u8()?;
+        Ok(())
+    }
+}
+
+impl Dmc {
+    fn save(&self, out: &mut Writer) {
+        out.bool(self.irq_enable);
+        out.bool(self.irq);
+        out.bool(self.looping);
+        out.u16(self.period);
+        out.u16(self.timer);
+        out.u8(self.level);
+        out.u16(self.sample_addr);
+        out.u16(self.sample_len);
+        out.u16(self.addr);
+        out.u16(self.remaining);
+        out.bool(self.buffer.is_some());
+        out.u8(self.buffer.unwrap_or(0));
+        out.u8(self.shift);
+        out.u8(self.bits);
+        out.bool(self.silence);
+    }
+
+    fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.irq_enable = r.bool()?;
+        self.irq = r.bool()?;
+        self.looping = r.bool()?;
+        self.period = r.u16()?.max(1);
+        self.timer = r.u16()?;
+        self.level = r.u8()? & 0x7F;
+        self.sample_addr = r.u16()?;
+        self.sample_len = r.u16()?;
+        self.addr = r.u16()?;
+        self.remaining = r.u16()?;
+        let has = r.bool()?;
+        let value = r.u8()?;
+        self.buffer = if has { Some(value) } else { None };
+        self.shift = r.u8()?;
+        self.bits = r.u8()?.clamp(1, 8);
+        self.silence = r.bool()?;
+        Ok(())
+    }
+}
+
+impl Apu {
+    pub fn save(&self, out: &mut Writer) {
+        for p in self.pulse.iter() {
+            p.save(out);
+        }
+        self.triangle.save(out);
+        self.noise.save(out);
+        self.dmc.save(out);
+        out.bool(self.mode5);
+        out.bool(self.irq_inhibit);
+        out.bool(self.frame_irq);
+        out.u32(self.frame_cycle);
+        out.bool(self.odd);
+        out.f64(self.sample_timer);
+        out.f32(self.sum);
+        out.u32(self.count);
+        out.f32(self.hp_in);
+        out.f32(self.hp_out);
+    }
+
+    pub fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        for p in self.pulse.iter_mut() {
+            p.load(r)?;
+        }
+        self.triangle.load(r)?;
+        self.noise.load(r)?;
+        self.dmc.load(r)?;
+        self.mode5 = r.bool()?;
+        self.irq_inhibit = r.bool()?;
+        self.frame_irq = r.bool()?;
+        self.frame_cycle = r.u32()?;
+        self.odd = r.bool()?;
+        self.sample_timer = r.f64()?;
+        self.sum = r.f32()?;
+        self.count = r.u32()?;
+        self.hp_in = r.f32()?;
+        self.hp_out = r.f32()?;
+        self.samples.clear();
+        Ok(())
     }
 }

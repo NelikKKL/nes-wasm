@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+use crate::state::{Reader, Writer};
 
 const FC: u8 = 0x01;
 const FZ: u8 = 0x02;
@@ -32,6 +33,8 @@ enum Op {
     CMP, CPX, CPY, DEC, DEX, DEY, EOR, INC, INX, INY, JMP, JSR, LDA, LDX, LDY, LSR, NOP,
     ORA, PHA, PHP, PLA, PLP, ROL, ROR, RTI, RTS, SBC, SEC, SED, SEI, STA, STX, STY, TAX,
     TAY, TSX, TXA, TXS, TYA,
+    // неофициальные
+    ALR, ANC, ARR, AXS, DCP, ISB, LAX, RLA, RRA, SAX, SLO, SRE,
 }
 
 pub struct Cpu {
@@ -51,6 +54,31 @@ pub struct Cpu {
 impl Cpu {
     pub fn new() -> Cpu {
         Cpu { a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: FI | FU, cycles: 0, nmi: false, irq: false }
+    }
+
+    pub fn save(&self, out: &mut Writer) {
+        out.u8(self.a);
+        out.u8(self.x);
+        out.u8(self.y);
+        out.u8(self.sp);
+        out.u16(self.pc);
+        out.u8(self.p);
+        out.u64(self.cycles);
+        out.bool(self.nmi);
+        out.bool(self.irq);
+    }
+
+    pub fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.a = r.u8()?;
+        self.x = r.u8()?;
+        self.y = r.u8()?;
+        self.sp = r.u8()?;
+        self.pc = r.u16()?;
+        self.p = r.u8()?;
+        self.cycles = r.u64()?;
+        self.nmi = r.bool()?;
+        self.irq = r.bool()?;
+        Ok(())
     }
 
     pub fn reset(&mut self, bus: &mut Bus) {
@@ -85,7 +113,7 @@ impl Cpu {
         if crossed
             && matches!(
                 op,
-                Op::LDA | Op::LDX | Op::LDY | Op::ADC | Op::SBC | Op::AND | Op::ORA | Op::EOR | Op::CMP | Op::NOP
+                Op::LDA | Op::LDX | Op::LDY | Op::ADC | Op::SBC | Op::AND | Op::ORA | Op::EOR | Op::CMP | Op::NOP | Op::LAX
             )
         {
             cycles += 1;
@@ -309,6 +337,69 @@ impl Cpu {
             CLD => self.set(FD, false),
             SED => self.set(FD, true),
             CLV => self.set(FV, false),
+            // ----- неофициальные опкоды -----
+            LAX => { let v = bus.read(addr); self.a = v; self.x = v; self.zn(v); }
+            SAX => bus.write(addr, self.a & self.x),
+            DCP => { let v = bus.read(addr).wrapping_sub(1); bus.write(addr, v); self.cmp(self.a, v); }
+            ISB => { let v = bus.read(addr).wrapping_add(1); bus.write(addr, v); self.adc(!v); }
+            SLO => {
+                let v = bus.read(addr);
+                self.set(FC, v & 0x80 != 0);
+                let r = v << 1;
+                bus.write(addr, r);
+                self.a |= r;
+                self.zn(self.a);
+            }
+            RLA => {
+                let v = bus.read(addr);
+                let c = self.p & FC;
+                self.set(FC, v & 0x80 != 0);
+                let r = (v << 1) | c;
+                bus.write(addr, r);
+                self.a &= r;
+                self.zn(self.a);
+            }
+            SRE => {
+                let v = bus.read(addr);
+                self.set(FC, v & 0x01 != 0);
+                let r = v >> 1;
+                bus.write(addr, r);
+                self.a ^= r;
+                self.zn(self.a);
+            }
+            RRA => {
+                let v = bus.read(addr);
+                let c = self.p & FC;
+                self.set(FC, v & 0x01 != 0);
+                let r = (v >> 1) | (c << 7);
+                bus.write(addr, r);
+                self.adc(r); // флаг C, оставшийся после сдвига, идёт в сложение
+            }
+            ANC => {
+                self.a &= bus.read(addr);
+                self.zn(self.a);
+                self.set(FC, self.a & 0x80 != 0);
+            }
+            ALR => {
+                self.a &= bus.read(addr);
+                self.set(FC, self.a & 0x01 != 0);
+                self.a >>= 1;
+                self.zn(self.a);
+            }
+            ARR => {
+                self.a &= bus.read(addr);
+                self.a = (self.a >> 1) | ((self.p & FC) << 7);
+                self.zn(self.a);
+                self.set(FC, self.a & 0x40 != 0);
+                self.set(FV, ((self.a >> 6) ^ (self.a >> 5)) & 1 != 0);
+            }
+            AXS => {
+                let t = self.a & self.x;
+                let v = bus.read(addr);
+                self.set(FC, t >= v);
+                self.x = t.wrapping_sub(v);
+                self.zn(self.x);
+            }
             NOP => {}
         }
         extra
@@ -352,6 +443,29 @@ fn decode(op: u8) -> (Op, Mode, u8) {
         0xE8 => (INX, Imp, 2), 0xE9 | 0xEB => (SBC, Imm, 2), 0xEA => (NOP, Imp, 2), 0xEC => (CPX, Abs, 4), 0xED => (SBC, Abs, 4), 0xEE => (INC, Abs, 6),
         0xF0 => (BEQ, Rel, 2), 0xF1 => (SBC, Izy, 5), 0xF5 => (SBC, Zpx, 4), 0xF6 => (INC, Zpx, 6),
         0xF8 => (SED, Imp, 2), 0xF9 => (SBC, Aby, 4), 0xFD => (SBC, Abx, 4), 0xFE => (INC, Abx, 7),
+        // неофициальные опкоды
+        0xA7 => (LAX, Zp, 3), 0xB7 => (LAX, Zpy, 4), 0xAF => (LAX, Abs, 4), 0xBF => (LAX, Aby, 4),
+        0xA3 => (LAX, Izx, 6), 0xB3 => (LAX, Izy, 5),
+        0x87 => (SAX, Zp, 3), 0x97 => (SAX, Zpy, 4), 0x8F => (SAX, Abs, 4), 0x83 => (SAX, Izx, 6),
+        0xC7 => (DCP, Zp, 5), 0xD7 => (DCP, Zpx, 6), 0xCF => (DCP, Abs, 6), 0xDF => (DCP, Abx, 7),
+        0xDB => (DCP, Aby, 7), 0xC3 => (DCP, Izx, 8), 0xD3 => (DCP, Izy, 8),
+        0xE7 => (ISB, Zp, 5), 0xF7 => (ISB, Zpx, 6), 0xEF => (ISB, Abs, 6), 0xFF => (ISB, Abx, 7),
+        0xFB => (ISB, Aby, 7), 0xE3 => (ISB, Izx, 8), 0xF3 => (ISB, Izy, 8),
+        0x07 => (SLO, Zp, 5), 0x17 => (SLO, Zpx, 6), 0x0F => (SLO, Abs, 6), 0x1F => (SLO, Abx, 7),
+        0x1B => (SLO, Aby, 7), 0x03 => (SLO, Izx, 8), 0x13 => (SLO, Izy, 8),
+        0x27 => (RLA, Zp, 5), 0x37 => (RLA, Zpx, 6), 0x2F => (RLA, Abs, 6), 0x3F => (RLA, Abx, 7),
+        0x3B => (RLA, Aby, 7), 0x23 => (RLA, Izx, 8), 0x33 => (RLA, Izy, 8),
+        0x47 => (SRE, Zp, 5), 0x57 => (SRE, Zpx, 6), 0x4F => (SRE, Abs, 6), 0x5F => (SRE, Abx, 7),
+        0x5B => (SRE, Aby, 7), 0x43 => (SRE, Izx, 8), 0x53 => (SRE, Izy, 8),
+        0x67 => (RRA, Zp, 5), 0x77 => (RRA, Zpx, 6), 0x6F => (RRA, Abs, 6), 0x7F => (RRA, Abx, 7),
+        0x7B => (RRA, Aby, 7), 0x63 => (RRA, Izx, 8), 0x73 => (RRA, Izy, 8),
+        0x0B | 0x2B => (ANC, Imm, 2), 0x4B => (ALR, Imm, 2), 0x6B => (ARR, Imm, 2), 0xCB => (AXS, Imm, 2),
+        // нестабильные опкоды (XAA, LAX #imm, AHX, TAS, SHY, SHX, LAS): ведём себя как NOP,
+        // но с правильной длиной, чтобы не сбить поток инструкций
+        0x8B | 0xAB => (NOP, Imm, 2),
+        0x93 => (NOP, Izy, 6),
+        0x9B | 0x9E | 0x9F | 0xBB => (NOP, Aby, 5),
+        0x9C => (NOP, Abx, 5),
         // неофициальные NOP (встречаются в некоторых играх)
         0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => (NOP, Imp, 2),
         0x80 | 0x82 | 0x89 | 0xC2 | 0xE2 => (NOP, Imm, 2),

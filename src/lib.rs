@@ -5,10 +5,12 @@ mod controller;
 mod cpu;
 mod player;
 mod ppu;
+mod state;
 
 use bus::Bus;
 use cartridge::Cartridge;
 use cpu::Cpu;
+use state::{fnv1a, Reader, Writer, MAGIC, VERSION};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -64,6 +66,63 @@ impl Emulator {
         self.bus.apu.samples.len()
     }
 
+    /// Сохранение: всё состояние консоли (CPU, PPU, APU, ОЗУ, мапперы) одним массивом байт.
+    /// Делай между кадрами, то есть просто вызывай, когда не идёт `frame()`.
+    pub fn save_state(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bytes(MAGIC);
+        w.u8(VERSION);
+        w.u32(self.bus.cart.rom_id());
+        self.cpu.save(&mut w);
+        w.bytes(&self.bus.ram);
+        w.bool(self.bus.dma_pending);
+        self.bus.pads[0].save(&mut w);
+        self.bus.pads[1].save(&mut w);
+        self.bus.ppu.save(&mut w);
+        self.bus.apu.save(&mut w);
+        self.bus.cart.save(&mut w);
+        let mut bytes = w.into_bytes();
+        let sum = fnv1a(&bytes);
+        bytes.extend_from_slice(&sum.to_le_bytes());
+        bytes
+    }
+
+    /// Загрузка сохранения. Бросает строку с причиной, если файл повреждён
+    /// или сделан в другой игре (тогда состояние эмулятора не меняется).
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), JsValue> {
+        // всё, что можно проверить заранее, проверяем до первого изменения
+        if data.len() < 4 + 1 + 4 + 4 {
+            return Err(JsValue::from_str("Файл сохранения слишком короткий"));
+        }
+        let (body, tail) = data.split_at(data.len() - 4);
+        let expected = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+        if fnv1a(body) != expected {
+            return Err(JsValue::from_str("Сохранение повреждено: не сходится контрольная сумма"));
+        }
+        let mut r = Reader::new(body);
+        let mut magic = [0u8; 4];
+        r.bytes(&mut magic).map_err(|e| JsValue::from_str(&e))?;
+        if &magic != MAGIC {
+            return Err(JsValue::from_str("Это не файл сохранения эмулятора"));
+        }
+        let version = r.u8().map_err(|e| JsValue::from_str(&e))?;
+        if version != VERSION {
+            return Err(JsValue::from_str(&format!("Версия сохранения {} не поддерживается", version)));
+        }
+        let id = r.u32().map_err(|e| JsValue::from_str(&e))?;
+        if id != self.bus.cart.rom_id() {
+            return Err(JsValue::from_str("Это сохранение от другой игры"));
+        }
+        match self.apply_state(&mut r) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // состояние могло примениться частично: возвращаем консоль в чистое состояние
+                self.reset();
+                Err(JsValue::from_str(&format!("{} (консоль сброшена)", e)))
+            }
+        }
+    }
+
     /// Состояние кнопок игрока (0 или 1) целиком.
     /// Биты: 0=A, 1=B, 2=Select, 3=Start, 4=Up, 5=Down, 6=Left, 7=Right.
     pub fn set_pad(&mut self, player: u8, state: u8) {
@@ -82,6 +141,23 @@ impl Emulator {
     /// Сэмплы звука, накопленные за последний кадр (моно, f32).
     pub(crate) fn audio_samples(&self) -> &[f32] {
         &self.bus.apu.samples
+    }
+
+    pub(crate) fn rom_id(&self) -> u32 {
+        self.bus.cart.rom_id()
+    }
+
+    fn apply_state(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.cpu.load(r)?;
+        r.bytes(&mut self.bus.ram)?;
+        self.bus.dma_pending = r.bool()?;
+        self.bus.pads[0].load(r)?;
+        self.bus.pads[1].load(r)?;
+        self.bus.ppu.load(r)?;
+        self.bus.apu.load(r)?;
+        self.bus.cart.load(r)?;
+        self.bus.apu.samples.clear();
+        Ok(())
     }
 
     fn step(&mut self) {

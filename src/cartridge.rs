@@ -1,3 +1,5 @@
+use crate::state::{fnv1a, fnv1a_from, Reader, Writer};
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mirroring {
     Horizontal,
@@ -32,6 +34,8 @@ pub struct Cartridge {
     a12: bool,
     a12_low_since: u64,
     ppu_clock: u64,
+    /// Отпечаток ROM: сохранение подходит только к той игре, из которой сделано.
+    rom_id: u32,
 }
 
 impl Cartridge {
@@ -67,6 +71,12 @@ impl Cartridge {
             (data[start + prg_size..start + prg_size + chr_size].to_vec(), false)
         };
 
+        let mut rom_id = fnv1a(&prg);
+        if !chr_ram {
+            rom_id = fnv1a_from(rom_id, &chr);
+        }
+        rom_id = fnv1a_from(rom_id, &[mapper]);
+
         Ok(Cartridge {
             mapper,
             prg,
@@ -89,11 +99,78 @@ impl Cartridge {
             a12: false,
             a12_low_since: 0,
             ppu_clock: 0,
+            rom_id,
         })
     }
 
     pub fn mirroring(&self) -> Mirroring {
         self.mirroring
+    }
+
+    pub fn rom_id(&self) -> u32 {
+        self.rom_id
+    }
+
+    // ---------- сохранения ----------
+
+    pub fn save(&self, out: &mut Writer) {
+        out.bytes(&self.prg_ram);
+        if self.chr_ram {
+            out.bytes(&self.chr);
+        }
+        out.u8(match self.mirroring {
+            Mirroring::Horizontal => 0,
+            Mirroring::Vertical => 1,
+            Mirroring::SingleLow => 2,
+            Mirroring::SingleHigh => 3,
+            Mirroring::FourScreen => 4,
+        });
+        out.u8(self.shift);
+        out.u8(self.control);
+        out.u8(self.chr0);
+        out.u8(self.chr1);
+        out.u8(self.prg_bank);
+        out.u8(self.mmc3_cmd);
+        out.bytes(&self.bank_regs);
+        out.u8(self.irq_latch);
+        out.u8(self.irq_counter);
+        out.bool(self.irq_reload);
+        out.bool(self.irq_enable);
+        out.bool(self.irq_pending);
+        out.bool(self.a12);
+        out.u64(self.a12_low_since);
+        out.u64(self.ppu_clock);
+    }
+
+    pub fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        r.bytes(&mut self.prg_ram)?;
+        if self.chr_ram {
+            r.bytes(&mut self.chr)?;
+        }
+        self.mirroring = match r.u8()? {
+            0 => Mirroring::Horizontal,
+            1 => Mirroring::Vertical,
+            2 => Mirroring::SingleLow,
+            3 => Mirroring::SingleHigh,
+            4 => Mirroring::FourScreen,
+            _ => return Err("Сохранение повреждено: неверное зеркалирование".to_string()),
+        };
+        self.shift = r.u8()?;
+        self.control = r.u8()?;
+        self.chr0 = r.u8()?;
+        self.chr1 = r.u8()?;
+        self.prg_bank = r.u8()?;
+        self.mmc3_cmd = r.u8()?;
+        r.bytes(&mut self.bank_regs)?;
+        self.irq_latch = r.u8()?;
+        self.irq_counter = r.u8()?;
+        self.irq_reload = r.bool()?;
+        self.irq_enable = r.bool()?;
+        self.irq_pending = r.bool()?;
+        self.a12 = r.bool()?;
+        self.a12_low_since = r.u64()?;
+        self.ppu_clock = r.u64()?;
+        Ok(())
     }
 
     /// PPU сообщает текущий такт (в точках PPU) — нужно MMC3 для фильтра линии A12.

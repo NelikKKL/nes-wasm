@@ -14,7 +14,9 @@
     .bar { display: flex; flex-wrap: wrap; gap: 8px; }
     button, .btn { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
                    border-radius: 4px; padding: 10px 14px; cursor: pointer; }
-    button:hover, .btn:hover { border-color: var(--muted); }
+    select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+             border-radius: 4px; padding: 10px 14px; max-width: 100%; }
+    button:hover, .btn:hover, select:hover { border-color: var(--muted); }
     .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     button:focus-visible, .btn:focus-within { outline: 2px solid var(--text); outline-offset: 2px; }
     .notes { display: grid; gap: 2px; }
@@ -42,8 +44,19 @@
       <button id="mute" type="button">Звук: вкл</button>
       <button id="binds" type="button">Управление</button>
     </div>
+    <div class="bar">
+      <select id="slot" aria-label="Слот сохранения">
+        <option value="1">Слот 1</option>
+        <option value="2">Слот 2</option>
+        <option value="3">Слот 3</option>
+      </select>
+      <button id="save" type="button">Сохранить</button>
+      <button id="load" type="button">Загрузить</button>
+      <button id="export" type="button">В файл</button>
+      <label class="btn">Из файла<input id="import" type="file" accept=".state" hidden></label>
+    </div>
     <div class="notes">
-      <p id="status">Выбери .nes файл или перетащи его на страницу.</p>
+      <p id="status">Выбери .nes файл или перетащи его на страницу. F5 — сохранить, F8 — загрузить.</p>
       <p id="audio-status"></p>
     </div>
   </main>
@@ -77,11 +90,14 @@
     const setStatus = (text) => { $('status').textContent = text; };
 
     // ---- ROM ----
+    let gameName = 'game';
     async function loadFile(file) {
       try {
         nes.loadRom(new Uint8Array(await file.arrayBuffer()));
+        gameName = file.name.replace(/\.nes$/i, '');
         $('pause').textContent = 'Пауза';
         setStatus(file.name);
+        refreshSlots();
       } catch (e) {
         setStatus(`Ошибка: ${e}`);
       }
@@ -104,6 +120,68 @@
       renderMute();
     });
     setInterval(() => { $('audio-status').textContent = nes.audioStatus(); }, 500);
+
+    // ---- сохранения ----
+    const slot = () => Number($('slot').value);
+
+    function refreshSlots() {
+      for (const opt of $('slot').options) {
+        const t = nes.slotTime(Number(opt.value));
+        opt.textContent = `Слот ${opt.value} — ${t ? new Date(t).toLocaleString() : 'пусто'}`;
+      }
+    }
+    refreshSlots();
+
+    function saveToSlot() {
+      try {
+        nes.saveSlot(slot());
+        setStatus(`Сохранено в слот ${slot()}`);
+        refreshSlots();
+      } catch (e) {
+        setStatus(`Ошибка: ${e}`);
+      }
+    }
+
+    function loadFromSlot() {
+      try {
+        nes.loadSlot(slot());
+        setStatus(`Загружено из слота ${slot()}`);
+      } catch (e) {
+        setStatus(`Ошибка: ${e}`);
+      }
+    }
+
+    $('save').addEventListener('click', saveToSlot);
+    $('load').addEventListener('click', loadFromSlot);
+    addEventListener('keydown', (e) => {
+      if (e.code === 'F5') { e.preventDefault(); saveToSlot(); }
+      else if (e.code === 'F8') { e.preventDefault(); loadFromSlot(); }
+    });
+
+    // сохранение в файл и обратно: так состояние можно перенести на другое устройство
+    $('export').addEventListener('click', () => {
+      try {
+        const bytes = nes.saveState();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+        a.download = `${gameName}.state`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        setStatus(`Ошибка: ${e}`);
+      }
+    });
+    $('import').addEventListener('change', async (e) => {
+      const f = e.target.files[0];
+      e.target.value = '';
+      if (!f) return;
+      try {
+        nes.loadState(new Uint8Array(await f.arrayBuffer()));
+        setStatus(`Загружено из файла ${f.name}`);
+      } catch (err) {
+        setStatus(`Ошибка: ${err}`);
+      }
+    });
 
     // ---- окно «Управление» на API привязок ----
     const NAMES = ['A', 'B', 'Select', 'Start', 'Up', 'Down', 'Left', 'Right'];

@@ -14,6 +14,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local, JsFuture};
 use web_sys::{Element, Event, EventTarget, HtmlCanvasElement, KeyboardEvent, Performance, Response, Window};
 
+use crate::state::{base64_decode, base64_encode};
 use crate::Emulator;
 
 const W: u32 = 256;
@@ -670,6 +671,37 @@ impl Inner {
         Ok(())
     }
 
+    // ----- сохранения -----
+
+    fn load_state(&mut self, data: &[u8]) -> Result<(), JsValue> {
+        match self.emu.as_mut() {
+            Some(emu) => emu.load_state(data)?,
+            None => return Err(err("Сначала загрузи игру")),
+        }
+        self.audio.shared.borrow_mut().clear();
+        self.acc = 0.0;
+        self.draw(); // на паузе сразу показываем загруженный кадр
+        Ok(())
+    }
+
+    fn storage(&self) -> Result<web_sys::Storage, JsValue> {
+        self.window
+            .local_storage()?
+            .ok_or_else(|| err("localStorage недоступен"))
+    }
+
+    /// Слоты хранятся отдельно для каждой игры: ключ включает отпечаток ROM.
+    fn slot_key(&self, slot: u8) -> Option<String> {
+        let id = self.emu.as_ref()?.rom_id();
+        Some(format!("{}:state:{:08x}:{}", self.storage_key, id, slot))
+    }
+
+    fn slot_raw(&self, slot: u8) -> Option<String> {
+        let key = self.slot_key(slot)?;
+        let storage = self.storage().ok()?;
+        storage.get_item(&key).ok().flatten()
+    }
+
     // ----- звук -----
 
     fn audio_rate(&self) -> f64 {
@@ -1043,6 +1075,71 @@ impl Nes {
     /// Во весь экран.
     pub fn fullscreen(&self) {
         let _ = call(&self.inner.borrow().canvas, "requestFullscreen", &[]);
+    }
+
+    // ----- сохранения -----
+
+    /// Состояние консоли целиком в виде байт (`Uint8Array`): можно положить в файл, IndexedDB и т.п.
+    #[wasm_bindgen(js_name = saveState)]
+    pub fn save_state(&self) -> Result<Vec<u8>, JsValue> {
+        match &self.inner.borrow().emu {
+            Some(emu) => Ok(emu.save_state()),
+            None => Err(err("Сначала загрузи игру")),
+        }
+    }
+
+    /// Загружает байты из `saveState()`. Бросает строку, если файл повреждён или от другой игры.
+    #[wasm_bindgen(js_name = loadState)]
+    pub fn load_state(&self, data: &[u8]) -> Result<(), JsValue> {
+        self.inner.borrow_mut().load_state(data)
+    }
+
+    /// Сохраняет состояние в слот (в localStorage; слоты у каждой игры свои). Номер слота: 0–255.
+    #[wasm_bindgen(js_name = saveSlot)]
+    pub fn save_slot(&self, slot: u8) -> Result<(), JsValue> {
+        let i = self.inner.borrow();
+        let key = i.slot_key(slot).ok_or_else(|| err("Сначала загрузи игру"))?;
+        let bytes = match &i.emu {
+            Some(emu) => emu.save_state(),
+            None => return Err(err("Сначала загрузи игру")),
+        };
+        let value = format!("{}|{}", js_sys::Date::now() as u64, base64_encode(&bytes));
+        i.storage()?
+            .set_item(&key, &value)
+            .map_err(|_| err("Не удалось сохранить: localStorage переполнен или запрещён"))
+    }
+
+    /// Загружает состояние из слота. Бросает строку, если слот пуст или повреждён.
+    #[wasm_bindgen(js_name = loadSlot)]
+    pub fn load_slot(&self, slot: u8) -> Result<(), JsValue> {
+        let mut i = self.inner.borrow_mut();
+        if i.emu.is_none() {
+            return Err(err("Сначала загрузи игру"));
+        }
+        let raw = i.slot_raw(slot).ok_or_else(|| err("Слот пуст"))?;
+        let payload = raw.splitn(2, '|').nth(1).unwrap_or("");
+        let bytes = base64_decode(payload).map_err(|e| err(&e))?;
+        i.load_state(&bytes)
+    }
+
+    #[wasm_bindgen(js_name = hasSlot)]
+    pub fn has_slot(&self, slot: u8) -> bool {
+        self.inner.borrow().slot_raw(slot).is_some()
+    }
+
+    /// Когда сделано сохранение в слоте (миллисекунды как у `Date.now()`) или `undefined`, если слот пуст.
+    #[wasm_bindgen(js_name = slotTime)]
+    pub fn slot_time(&self, slot: u8) -> Option<f64> {
+        let raw = self.inner.borrow().slot_raw(slot)?;
+        raw.split('|').next()?.parse::<f64>().ok()
+    }
+
+    #[wasm_bindgen(js_name = deleteSlot)]
+    pub fn delete_slot(&self, slot: u8) {
+        let i = self.inner.borrow();
+        if let (Some(key), Ok(storage)) = (i.slot_key(slot), i.storage()) {
+            let _ = storage.remove_item(&key);
+        }
     }
 
     // ----- звук -----

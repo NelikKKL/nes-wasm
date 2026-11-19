@@ -1,4 +1,5 @@
 use crate::cartridge::{Cartridge, Mirroring};
+use crate::state::{Reader, Writer};
 
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 240;
@@ -500,5 +501,139 @@ impl Ppu {
                 self.odd_frame = !self.odd_frame;
             }
         }
+    }
+}
+
+// ---------- сохранения ----------
+
+impl Ppu {
+    pub fn save(&self, out: &mut Writer) {
+        out.bool(self.frame_complete);
+        out.bool(self.nmi);
+        out.u8(self.ctrl);
+        out.u8(self.mask);
+        out.u8(self.status);
+        out.bytes(&self.oam);
+        out.u8(self.oam_addr);
+        out.bytes(&self.vram);
+        out.bytes(&self.palette);
+        out.u16(self.v);
+        out.u16(self.t);
+        out.u8(self.fine_x);
+        out.bool(self.w);
+        out.u8(self.buffer);
+        out.i16(self.scanline);
+        out.u16(self.cycle);
+        out.bool(self.odd_frame);
+        out.u64(self.dots);
+        out.u8(self.nt_id);
+        out.u8(self.nt_attr);
+        out.u8(self.nt_lo);
+        out.u8(self.nt_hi);
+        out.u16(self.bg_lo);
+        out.u16(self.bg_hi);
+        out.u16(self.at_lo);
+        out.u16(self.at_hi);
+        out.u8(self.spr_count as u8);
+        out.bool(self.spr_zero);
+        out.bytes(&self.spr_x);
+        out.bytes(&self.spr_attr);
+        out.bytes(&self.spr_lo);
+        out.bytes(&self.spr_hi);
+        self.save_frame(out);
+    }
+
+    pub fn load(&mut self, r: &mut Reader) -> Result<(), String> {
+        self.frame_complete = r.bool()?;
+        self.nmi = r.bool()?;
+        self.ctrl = r.u8()?;
+        self.mask = r.u8()?;
+        self.status = r.u8()?;
+        r.bytes(&mut self.oam)?;
+        self.oam_addr = r.u8()?;
+        r.bytes(&mut self.vram)?;
+        r.bytes(&mut self.palette)?;
+        self.v = r.u16()?;
+        self.t = r.u16()?;
+        self.fine_x = r.u8()? & 7;
+        self.w = r.bool()?;
+        self.buffer = r.u8()?;
+        let scanline = r.i16()?;
+        let cycle = r.u16()?;
+        if !(-1..=260).contains(&scanline) || cycle > 340 {
+            return Err("Сохранение повреждено: неверная позиция PPU".to_string());
+        }
+        self.scanline = scanline;
+        self.cycle = cycle;
+        self.odd_frame = r.bool()?;
+        self.dots = r.u64()?;
+        self.nt_id = r.u8()?;
+        self.nt_attr = r.u8()? & 3;
+        self.nt_lo = r.u8()?;
+        self.nt_hi = r.u8()?;
+        self.bg_lo = r.u16()?;
+        self.bg_hi = r.u16()?;
+        self.at_lo = r.u16()?;
+        self.at_hi = r.u16()?;
+        let n = r.u8()? as usize;
+        if n > 8 {
+            return Err("Сохранение повреждено: неверное число спрайтов".to_string());
+        }
+        self.spr_count = n;
+        self.spr_zero = r.bool()?;
+        r.bytes(&mut self.spr_x)?;
+        r.bytes(&mut self.spr_attr)?;
+        r.bytes(&mut self.spr_lo)?;
+        r.bytes(&mut self.spr_hi)?;
+        self.load_frame(r)
+    }
+
+    /// Кадр сохраняем, чтобы после загрузки на паузе сразу показать картинку.
+    /// Простое RLE по пикселям: [длина u16][R][G][B] (альфа всегда 255).
+    fn save_frame(&self, out: &mut Writer) {
+        let px = &self.frame;
+        let n = px.len() / 4;
+        let mut body = Writer::new();
+        let mut runs: u32 = 0;
+        let mut i = 0usize;
+        while i < n {
+            let c = [px[i * 4], px[i * 4 + 1], px[i * 4 + 2]];
+            let mut run = 1usize;
+            while i + run < n && run < 65535 && px[(i + run) * 4..(i + run) * 4 + 3] == c {
+                run += 1;
+            }
+            body.u16(run as u16);
+            body.bytes(&c);
+            i += run;
+            runs += 1;
+        }
+        out.u32(runs);
+        out.bytes(&body.into_bytes());
+    }
+
+    fn load_frame(&mut self, r: &mut Reader) -> Result<(), String> {
+        let runs = r.u32()?;
+        let total = WIDTH * HEIGHT;
+        let mut i = 0usize;
+        for _ in 0..runs {
+            let run = r.u16()? as usize;
+            let mut c = [0u8; 3];
+            r.bytes(&mut c)?;
+            if i + run > total {
+                return Err("Сохранение повреждено: кадр не совпадает по размеру".to_string());
+            }
+            for k in 0..run {
+                let o = (i + k) * 4;
+                self.frame[o] = c[0];
+                self.frame[o + 1] = c[1];
+                self.frame[o + 2] = c[2];
+                self.frame[o + 3] = 255;
+            }
+            i += run;
+        }
+        if i != total {
+            return Err("Сохранение повреждено: кадр неполный".to_string());
+        }
+        Ok(())
     }
 }

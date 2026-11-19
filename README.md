@@ -64,6 +64,9 @@ NES-эмулятор на Rust, собранный в WebAssembly. Подклю�
 | `fullscreen()` | во весь экран |
 | `canvas` | canvas игры |
 | `enableAudio()` | включить звук вручную (при `autoAudio: false`, из обработчика клика) |
+| `saveState()` / `loadState(bytes)` | сохранение целиком в виде `Uint8Array` (в файл, IndexedDB и т.п.) |
+| `saveSlot(n)` / `loadSlot(n)` | сохранение в слот `n` (0–255) в localStorage, слоты у каждой игры свои |
+| `hasSlot(n)` / `slotTime(n)` / `deleteSlot(n)` | есть ли сохранение, когда сделано (как `Date.now()`), удалить |
 | `setMuted(bool)` / `muted` | выключить звук |
 | `setVolume(x)` / `volume` | громкость |
 | `audioStatus()` | строка про состояние звука для диагностики |
@@ -76,6 +79,22 @@ NES-эмулятор на Rust, собранный в WebAssembly. Подклю�
 
 `player`: `0` или `1`. `button`: `A`, `B`, `Select`, `Start`, `Up`, `Down`, `Left`, `Right`.
 Привязки сохраняются в localStorage.
+
+### Сохранения
+
+```js
+nes.saveSlot(1);                 // сохранить в слот 1
+nes.loadSlot(1);                 // загрузить (бросает строку, если слот пуст)
+nes.slotTime(1);                 // время сохранения или undefined
+
+const bytes = nes.saveState();   // то же самое байтами: положи куда угодно
+nes.loadState(bytes);
+```
+
+Сохраняется всё состояние консоли: процессор, видео, звук, память и регистры мапперов (в том числе
+батарейная память игр). Сохранение привязано к игре: если загрузить его в другую, будет понятная ошибка.
+Размер около 70 КБ; слоты в localStorage кодируются в base64, а при большом числе игр удобнее
+хранить `saveState()` в IndexedDB. Загрузка работает и на паузе: картинка обновляется сразу.
 
 ### Переназначение клавиши
 
@@ -97,14 +116,17 @@ console.log(nes.getBindings()[0].A);
 
 Если нужен только процессор без окна и звука, есть класс `Emulator`:
 `new Emulator(rom)`, `frame()`, `frame_ptr()`, `set_pad(player, state)`, `audio_ptr()`, `audio_len()`,
-`set_sample_rate(rate)`, `reset()`.
+`set_sample_rate(rate)`, `reset()`, `save_state()`, `load_state(bytes)`.
 
 ## Что умеет эмулятор
 
-- CPU 6502 (все официальные опкоды), PPU с фоном, спрайтами и скроллингом
+- CPU 6502: все официальные опкоды и стабильные неофициальные (LAX, SAX, DCP, ISB, SLO, RLA, SRE, RRA,
+  ANC, ALR, ARR, AXS, SBC $EB и разные NOP); нестабильные (XAA, AHX, TAS, SHX, SHY, LAS) ведут себя как NOP
+  правильной длины
+- PPU с фоном, спрайтами и скроллингом
 - Мапперы: 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM), 4 (MMC3), 7 (AxROM)
 - APU: 2 pulse, triangle, noise, DMC, frame counter с IRQ
-- Два игрока
+- Два игрока, сохранения состояния
 
 ## Сборка
 
