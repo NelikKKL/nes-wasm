@@ -120,9 +120,10 @@ console.log(nes.getBindings()[0].A);
 
 ## Что умеет эмулятор
 
-- CPU 6502: все официальные опкоды и стабильные неофициальные (LAX, SAX, DCP, ISB, SLO, RLA, SRE, RRA,
-  ANC, ALR, ARR, AXS, SBC $EB и разные NOP); нестабильные (XAA, AHX, TAS, SHX, SHY, LAS) ведут себя как NOP
-  правильной длины
+- CPU 6502: все 256 опкодов: официальные, стабильные неофициальные (LAX, SAX, DCP, ISB, SLO, RLA, SRE, RRA,
+  ANC, ALR, ARR, AXS, SBC $EB, разные NOP), нестабильные (LXA/ATX, XAA, AHX, TAS, SHX, SHY, LAS; у SHX/SHY/AHX/TAS
+  при переходе страницы портится старший байт адреса, как на железе) и 12 опкодов KIL/JAM (процессор встаёт
+  до сброса). Проходит blargg `instr_test` (all_instrs, 15 тестов)
 - PPU с фоном, спрайтами и скроллингом
 - Мапперы: 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM), 4 (MMC3), 7 (AxROM)
 - APU: 2 pulse, triangle, noise, DMC, frame counter с IRQ

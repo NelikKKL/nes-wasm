@@ -449,6 +449,8 @@ struct Inner {
     capture: Option<Capture>,
     last: f64,
     acc: f64,
+    /// Сглаженный период обновления экрана в мс (0 — пока не измерен).
+    refresh: f64,
     audio: Audio,
     listeners: Vec<Listener>,
     raf_closure: Option<Closure<dyn FnMut(f64)>>,
@@ -517,29 +519,46 @@ impl Inner {
             self.last = t;
             return;
         }
+        let dt = (t - self.last).clamp(0.0, 100.0);
+        self.last = t;
+        // сглаженный период обновления экрана; паузы и фоновые вкладки не учитываем
+        if dt > 2.0 && dt < 40.0 {
+            self.refresh = if self.refresh > 0.0 { self.refresh * 0.9 + dt * 0.1 } else { dt };
+        }
+        // Звук включён, если контекст работает и вывод отвечает
+        let audio_on = self.audio_ready(t);
         let mut ran = 0;
-        if self.audio_ready(t) {
-            // темп задаёт звук: считаем кадры, пока в буфере меньше целевого запаса
-            let target = self.audio_rate() * self.audio.buffer_seconds;
-            loop {
+        if (self.refresh - FRAME_MS).abs() < FRAME_MS * 0.05 && dt < FRAME_MS * 1.5 {
+            // Экран ~60 Гц: ровно один кадр эмуляции на один кадр экрана. Раньше число кадров
+            // за тик зависело от заполнения звукового буфера: за один тик иногда считалось два кадра
+            // (показывался только последний), а иногда ни одного (картинка повторялась), и спрайты,
+            // которые игра чередует по кадрам, мерцали. Теперь ни один кадр не теряется и не
+            // повторяется, а небольшое расхождение 60.0988 Гц и частоты экрана гасит run_frame():
+            // он чуть подтягивает частоту сэмплов, следя за буфером.
+            let mut n = 1;
+            if audio_on {
+                let target = self.audio_rate() * self.audio.buffer_seconds;
                 let level = self.audio.shared.borrow().level;
-                if level >= target || ran >= 4 {
-                    break;
+                if level < target * 0.5 {
+                    n = 2; // буфер почти пуст (старт, возврат на вкладку): досчитываем кадр
+                } else if level > target * 3.0 {
+                    n = 0; // буфер переполнен: даём ему опустеть
                 }
-                self.run_frame(true);
+            }
+            for _ in 0..n {
+                self.run_frame(audio_on);
                 ran += 1;
             }
             self.acc = 0.0;
         } else {
-            // звука нет (ещё не было жеста или он недоступен) — темп по таймеру
-            self.acc += (t - self.last).min(100.0);
+            // экран с другой частотой (50, 75, 120, 144 Гц) или кадр экрана пропущен: темп по времени
+            self.acc += dt;
             while self.acc >= FRAME_MS {
-                self.run_frame(false);
+                self.run_frame(audio_on);
                 self.acc -= FRAME_MS;
                 ran += 1;
             }
         }
-        self.last = t;
         if ran > 0 {
             self.draw();
         }
@@ -549,10 +568,23 @@ impl Inner {
         self.poll_gamepads();
         let p0 = self.keys[0] | self.pads[0];
         let p1 = self.keys[1] | self.pads[1];
+        // Подстройка частоты звука по заполнению буфера (в пределах ±2%, обычно доли процента):
+        // буфер мал - делаем чуть больше сэмплов за кадр, велик - чуть меньше.
+        let rate = if audio_on {
+            let base = self.audio_rate();
+            let target = base * self.audio.buffer_seconds;
+            let level = self.audio.shared.borrow().level;
+            base * (1.0 + ((target - level) / target).clamp(-1.0, 1.0) * 0.02)
+        } else {
+            0.0
+        };
         let samples: Vec<f32> = match self.emu.as_mut() {
             Some(emu) => {
                 emu.set_pad(0, p0);
                 emu.set_pad(1, p1);
+                if audio_on {
+                    emu.set_sample_rate(rate as f32);
+                }
                 emu.frame();
                 if audio_on {
                     emu.audio_samples().to_vec()
@@ -950,6 +982,7 @@ impl Nes {
             capture: None,
             last: 0.0,
             acc: 0.0,
+            refresh: 0.0,
             audio: Audio {
                 ctx: None,
                 gain: None,

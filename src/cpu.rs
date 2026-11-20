@@ -35,6 +35,8 @@ enum Op {
     TAY, TSX, TXA, TXS, TYA,
     // неофициальные
     ALR, ANC, ARR, AXS, DCP, ISB, LAX, RLA, RRA, SAX, SLO, SRE,
+    // неофициальные «нестабильные» и зависание процессора
+    AHX, ATX, KIL, LAS, SHX, SHY, TAS, XAA,
 }
 
 pub struct Cpu {
@@ -49,11 +51,14 @@ pub struct Cpu {
     pub nmi: bool,
     /// Уровень линии IRQ (APU, позже мапперы). Обрабатывается, если флаг I сброшен.
     pub irq: bool,
+    /// Процессор завис после KIL/JAM. Выводит из этого состояния только сброс.
+    /// В сохранение не пишется: после загрузки pc указывает на сам KIL, он зависнет заново.
+    halted: bool,
 }
 
 impl Cpu {
     pub fn new() -> Cpu {
-        Cpu { a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: FI | FU, cycles: 0, nmi: false, irq: false }
+        Cpu { a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: FI | FU, cycles: 0, nmi: false, irq: false, halted: false }
     }
 
     pub fn save(&self, out: &mut Writer) {
@@ -78,6 +83,7 @@ impl Cpu {
         self.cycles = r.u64()?;
         self.nmi = r.bool()?;
         self.irq = r.bool()?;
+        self.halted = false;
         Ok(())
     }
 
@@ -91,10 +97,17 @@ impl Cpu {
         self.cycles = 7;
         self.nmi = false;
         self.irq = false;
+        self.halted = false;
     }
 
     /// Выполняет одну инструкцию (или вход в NMI), возвращает число тактов CPU.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        if self.halted {
+            // KIL: ни NMI, ни IRQ процессор уже не слышит, живёт только PPU/APU
+            self.nmi = false;
+            self.cycles += 2;
+            return 2;
+        }
         if self.nmi {
             self.nmi = false;
             self.interrupt(bus, 0xFFFA, false);
@@ -113,12 +126,12 @@ impl Cpu {
         if crossed
             && matches!(
                 op,
-                Op::LDA | Op::LDX | Op::LDY | Op::ADC | Op::SBC | Op::AND | Op::ORA | Op::EOR | Op::CMP | Op::NOP | Op::LAX
+                Op::LDA | Op::LDX | Op::LDY | Op::ADC | Op::SBC | Op::AND | Op::ORA | Op::EOR | Op::CMP | Op::NOP | Op::LAX | Op::LAS
             )
         {
             cycles += 1;
         }
-        cycles += self.execute(bus, op, mode, addr);
+        cycles += self.execute(bus, op, mode, addr, crossed);
         self.cycles += cycles as u64;
         cycles
     }
@@ -253,7 +266,7 @@ impl Cpu {
         }
     }
 
-    fn execute(&mut self, bus: &mut Bus, op: Op, mode: Mode, addr: u16) -> u32 {
+    fn execute(&mut self, bus: &mut Bus, op: Op, mode: Mode, addr: u16, crossed: bool) -> u32 {
         use Op::*;
         let mut extra = 0;
         match op {
@@ -400,6 +413,35 @@ impl Cpu {
                 self.x = t.wrapping_sub(v);
                 self.zn(self.x);
             }
+            // ----- нестабильные опкоды -----
+            // LXA/ATX #imm: на железе A = X = (A | магическая константа) & imm; у NES константа $FF
+            ATX => { let v = bus.read(addr); self.a = v; self.x = v; self.zn(v); }
+            // XAA/ANE #imm: A = (A | магическая константа) & X & imm
+            XAA => { let v = bus.read(addr); self.a = (self.a | 0xFF) & self.x & v; self.zn(self.a); }
+            // LAS abs,Y: A = X = SP = память & SP
+            LAS => {
+                let v = bus.read(addr) & self.sp;
+                self.a = v;
+                self.x = v;
+                self.sp = v;
+                self.zn(v);
+            }
+            // AHX/SHA, TAS, SHY, SHX: пишут (регистр & (старший байт базового адреса + 1)).
+            // Если индексация перешла страницу, этим же значением портится старший байт адреса.
+            AHX | TAS | SHY | SHX => {
+                let reg = match op {
+                    SHY => self.y,
+                    SHX => self.x,
+                    TAS => { self.sp = self.a & self.x; self.sp }
+                    _ => self.a & self.x,
+                };
+                let hi = ((addr >> 8) as u8).wrapping_sub(crossed as u8).wrapping_add(1);
+                let v = reg & hi;
+                let target = if crossed { ((v as u16) << 8) | (addr & 0x00FF) } else { addr };
+                bus.write(target, v);
+            }
+            // KIL/JAM: процессор намертво встаёт на этом опкоде
+            KIL => { self.halted = true; self.pc = self.pc.wrapping_sub(1); }
             NOP => {}
         }
         extra
@@ -407,6 +449,7 @@ impl Cpu {
 }
 
 /// opcode -> (операция, режим адресации, базовые такты)
+#[allow(unreachable_patterns)]
 fn decode(op: u8) -> (Op, Mode, u8) {
     use Mode::*;
     use Op::*;
@@ -460,12 +503,12 @@ fn decode(op: u8) -> (Op, Mode, u8) {
         0x67 => (RRA, Zp, 5), 0x77 => (RRA, Zpx, 6), 0x6F => (RRA, Abs, 6), 0x7F => (RRA, Abx, 7),
         0x7B => (RRA, Aby, 7), 0x63 => (RRA, Izx, 8), 0x73 => (RRA, Izy, 8),
         0x0B | 0x2B => (ANC, Imm, 2), 0x4B => (ALR, Imm, 2), 0x6B => (ARR, Imm, 2), 0xCB => (AXS, Imm, 2),
-        // нестабильные опкоды (XAA, LAX #imm, AHX, TAS, SHY, SHX, LAS): ведём себя как NOP,
-        // но с правильной длиной, чтобы не сбить поток инструкций
-        0x8B | 0xAB => (NOP, Imm, 2),
-        0x93 => (NOP, Izy, 6),
-        0x9B | 0x9E | 0x9F | 0xBB => (NOP, Aby, 5),
-        0x9C => (NOP, Abx, 5),
+        // нестабильные опкоды
+        0x8B => (XAA, Imm, 2), 0xAB => (ATX, Imm, 2),
+        0x93 => (AHX, Izy, 6), 0x9F => (AHX, Aby, 5), 0x9B => (TAS, Aby, 5),
+        0x9C => (SHY, Abx, 5), 0x9E => (SHX, Aby, 5), 0xBB => (LAS, Aby, 4),
+        // KIL/JAM: 12 опкодов, после них процессор не отвечает
+        0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => (KIL, Imp, 2),
         // неофициальные NOP (встречаются в некоторых играх)
         0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => (NOP, Imp, 2),
         0x80 | 0x82 | 0x89 | 0xC2 | 0xE2 => (NOP, Imm, 2),
@@ -473,7 +516,7 @@ fn decode(op: u8) -> (Op, Mode, u8) {
         0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 => (NOP, Zpx, 4),
         0x0C => (NOP, Abs, 4),
         0x1C | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => (NOP, Abx, 4),
-        // остальные неофициальные опкоды пока трактуем как NOP
+        // все 256 опкодов описаны выше; эта ветка нужна только компилятору
         _ => (NOP, Imp, 2),
     }
 }
